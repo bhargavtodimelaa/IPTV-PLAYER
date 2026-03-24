@@ -884,6 +884,46 @@
 
 <script>
 /* ═══════════════════════════════════════
+   CORS PROXY CONFIG
+   Set your Cloudflare Worker URL here.
+   Leave empty '' to disable proxy (direct fetch).
+   e.g. 'https://iptv-proxy.YOUR-NAME.workers.dev'
+═══════════════════════════════════════ */
+const PROXY_BASE = 'https://wispy-sun-7307.bhargavtodimela4.workers.dev/';
+
+/**
+ * Wraps a stream URL through the Cloudflare Worker proxy.
+ * Also encodes any custom headers as base64 JSON so the
+ * worker can forward them on the server side.
+ */
+function proxyUrl(url, headers = {}) {
+  if (!PROXY_BASE) return url; // proxy disabled
+  let proxied = `${PROXY_BASE}?url=${encodeURIComponent(url)}`;
+  if (Object.keys(headers).length > 0) {
+    try {
+      proxied += `&headers=${btoa(JSON.stringify(headers))}`;
+    } catch(e) {}
+  }
+  return proxied;
+}
+
+/**
+ * Returns true if the stream URL needs proxying.
+ * On localhost/file:// we skip proxy — direct works fine.
+ * On deployed HTTPS origins we always proxy to handle 302s and CORS.
+ */
+function needsProxy(url) {
+  if (!PROXY_BASE) return false;
+  const isLocal = location.hostname === 'localhost'
+    || location.hostname === '127.0.0.1'
+    || location.protocol === 'file:';
+  if (isLocal) return false;
+  // Skip proxying if URL is already pointing to our worker
+  if (url.startsWith(PROXY_BASE)) return false;
+  return true;
+}
+
+/* ═══════════════════════════════════════
    STATE
 ═══════════════════════════════════════ */
 let allChannels = [];
@@ -1548,6 +1588,11 @@ function startStream(ch) {
 
 /* ═══════════════════════════════════════
    HLS HELPER
+   ★ 302-redirect fix: when deployed, route
+   the manifest URL through the CF Worker so
+   all redirects are resolved server-side and
+   segments are also proxied back via rewritten
+   M3U8. HLS.js never sees a cross-origin 302.
 ═══════════════════════════════════════ */
 function tryHls(ch, video) {
   const spinner = document.getElementById('spinner');
@@ -1559,14 +1604,21 @@ function tryHls(ch, video) {
     return;
   }
 
+  // ★ KEY FIX: use proxy URL when deployed so 302 redirects are
+  // followed server-side by the Cloudflare Worker, not by XHR.
+  const useProxy = needsProxy(ch.url);
+  const streamUrl = useProxy ? proxyUrl(ch.url, ch.headers) : ch.url;
+
   const hlsCfg = {
     enableWorker: true,
     lowLatencyMode: true,
     maxBufferLength: 30,
     backBufferLength: 10,
+    // When NOT proxying, forward custom headers via xhrSetup
+    // When proxying, headers are sent as base64 param — xhrSetup not needed
   };
 
-  if (Object.keys(ch.headers).length > 0) {
+  if (!useProxy && Object.keys(ch.headers).length > 0) {
     hlsCfg.xhrSetup = (xhr) => {
       Object.entries(ch.headers).forEach(([k, v]) => {
         try { xhr.setRequestHeader(k, v); } catch(e) {}
@@ -1577,7 +1629,62 @@ function tryHls(ch, video) {
   if (Hls.isSupported()) {
     const hls = new Hls(hlsCfg);
     currentHls = hls;
-    hls.loadSource(ch.url);
+    hls.loadSource(streamUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      spinner.classList.add('hidden');
+      video.play().catch(() => {});
+    });
+    hls.on(Hls.Events.ERROR, (ev, data) => {
+      if (data.fatal) {
+        spinner.classList.add('hidden');
+
+        // ★ If proxy is disabled and it's a network error, suggest enabling proxy
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !useProxy && PROXY_BASE) {
+          showSnack(`Network error — retrying with proxy…`, 'info');
+          try { hls.destroy(); } catch(e) {}
+          currentHls = null;
+          // Force proxy on retry
+          const proxiedCh = { ...ch, _forceProxy: true };
+          tryHlsForced(proxiedCh, video);
+          return;
+        }
+
+        retryBtn.classList.add('show');
+        const msg = data.type === Hls.ErrorTypes.NETWORK_ERROR
+          ? `Network/CORS error — "${ch.name}". ${PROXY_BASE ? 'Proxy also failed.' : 'Try setting PROXY_BASE.'}`
+          : `HLS error: ${data.details}`;
+        showSnack(msg, 'error');
+        try { hls.destroy(); } catch(e) {}
+        currentHls = null;
+        document.title = 'IPTV Pro — Bhargav Todimela';
+      }
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS — src set directly, Safari follows 302 natively
+    video.preload = 'metadata';
+    video.src = streamUrl;
+    video.load();
+    video.play().catch(() => {});
+  } else {
+    showSnack('HLS not supported in this browser.', 'error');
+    spinner.classList.add('hidden');
+  }
+}
+
+/** Force-proxy retry (called after a non-proxied attempt fails) */
+function tryHlsForced(ch, video) {
+  const spinner = document.getElementById('spinner');
+  const retryBtn = document.getElementById('retryBtn');
+  spinner.classList.remove('hidden');
+
+  const streamUrl = proxyUrl(ch.url, ch.headers);
+  const hlsCfg = { enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, backBufferLength: 10 };
+
+  if (Hls.isSupported()) {
+    const hls = new Hls(hlsCfg);
+    currentHls = hls;
+    hls.loadSource(streamUrl);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       spinner.classList.add('hidden');
@@ -1587,24 +1694,12 @@ function tryHls(ch, video) {
       if (data.fatal) {
         spinner.classList.add('hidden');
         retryBtn.classList.add('show');
-        const msg = data.type === Hls.ErrorTypes.NETWORK_ERROR
-          ? `Network error — "${ch.name}" may be offline or CORS-blocked`
-          : `HLS error: ${data.details}`;
-        showSnack(msg, 'error');
+        showSnack(`Stream failed even with proxy — "${ch.name}" may be offline.`, 'error');
         try { hls.destroy(); } catch(e) {}
         currentHls = null;
         document.title = 'IPTV Pro — Bhargav Todimela';
       }
     });
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari native HLS
-    video.preload = 'metadata';
-    video.src = ch.url;
-    video.load();
-    video.play().catch(() => {});
-  } else {
-    showSnack('HLS not supported in this browser.', 'error');
-    spinner.classList.add('hidden');
   }
 }
 
